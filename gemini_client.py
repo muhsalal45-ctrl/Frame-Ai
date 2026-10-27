@@ -41,6 +41,7 @@ TASKS = {
     "code": "heavy",      # stage 5: Manim code
     "repair": "heavy",    # stage 5: fixing broken Manim code
     "spec": "medium",     # stage 4: animation plan pinned to sentences
+    "route": "medium",    # stage 4b: Remotion or Manim for each scene
     "analyze": "light",   # stage 3: concepts / key points
 }
 
@@ -197,8 +198,8 @@ def http_options():
     """The SDK retries 429s internally (and sleeps for minutes/hours), which hides them from
     our key/model rotation. Turn that off for 429; keep a couple of quick retries for 5xx."""
     return types.HttpOptions(
-        timeout=180_000,
-        retry_options=types.HttpRetryOptions(attempts=2, http_status_codes=[500, 502, 504]))
+        timeout=90_000,   # a healthy answer arrives well inside this; a hung model should fail fast
+        retry_options=types.HttpRetryOptions(attempts=1, http_status_codes=[500, 502]))  # no SDK retry: the Rotator switches model instead
 
 
 # ---- Gemini ----------------------------------------------------------------
@@ -234,7 +235,9 @@ def classify_gemini(e):
         return "bad_key", 0
     if code == 503 or "overloaded" in low:          # "service unavailable" -> use another model
         return "overloaded", 30
-    if code in (500, 502, 504):
+    if code == 504 or "deadline_exceeded" in low:  # model is hanging: treat like overloaded, move on
+        return "overloaded", 60
+    if code in (500, 502):
         return "transient", 15
     if code is None and any(s in type(e).__name__ for s in ("Timeout", "Connect", "Remote", "Read")):
         return "transient", 10
@@ -314,6 +317,31 @@ class Gemini:
         tier = tier_of(task)
         return self.rot.run(lambda k, m: self._call(k, m, prompt, as_json, tier, temperature),
                             self.chain(task), label=f"{task}/{tier}")
+
+    def search(self, prompt, temperature=0.3, task="medium"):
+        """Plain-text answer grounded in Google Search. Returns (text, sources[{title,url}]). Raises BadOutput when the
+        model answered without using any search result, so a 'search' that did not search can never pass."""
+        def call(key, model):
+            cfg = {"tools": [types.Tool(google_search=types.GoogleSearch())]}
+            if model.startswith(("gemini-2.5",)):
+                cfg["temperature"] = temperature
+            r = self._client(key).models.generate_content(
+                model=model, contents=prompt, config=types.GenerateContentConfig(
+                    automatic_function_calling=types.AutomaticFunctionCallingConfig(disable=True), **cfg))
+            try:
+                text = r.text
+            except Exception:  # noqa: BLE001
+                text = None
+            if not text:
+                raise BadOutput("empty search answer")
+            gm = getattr(r.candidates[0], "grounding_metadata", None) if getattr(r, "candidates", None) else None
+            chunks = (getattr(gm, "grounding_chunks", None) or [])
+            sources = [{"title": getattr(c.web, "title", "") or "", "url": getattr(c.web, "uri", "") or ""}
+                       for c in chunks if getattr(c, "web", None)]
+            if not sources:
+                raise BadOutput("the answer came without any Google Search result (search was not used)")
+            return text, sources
+        return self.rot.run(call, self.chain(task), label="research/search")
 
     def json(self, prompt, temperature=0.4, task="analyze"):
         return self.run(task, prompt, True, temperature)

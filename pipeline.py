@@ -40,12 +40,13 @@ import sys
 from dataclasses import fields
 from pathlib import Path
 
-from config import VideoConfig, cached, csv, duration, env_list, load_env, run
+from config import VideoConfig, cached, csv, duration, env_list, load_env, run, save_json
 from gemini_client import Gemini, QuotaExhausted, list_models
 from media import stage_assemble
-from script_input import stage_script_text
-from stages_gemini import (stage_analyze, stage_audio, stage_manim, stage_script,
-                           stage_spec)
+from remotion_stage import Env, stage_route, stage_visuals
+from research import stage_research
+from script_input import stage_script_source, stage_script_text
+from stages_gemini import (stage_analyze, stage_audio, stage_script, stage_spec)
 from tts import TTS, list_cloud_voices
 
 log = logging.getLogger("edu")
@@ -106,24 +107,32 @@ def make_video(cfg: VideoConfig, services: Services | None = None) -> Path:
     log.addHandler(fh)
     try:
         log.info("=== %s  [%s, narration=%s, screen=%s, voice=%s] ===",
-                 cfg.topic, "own script" if cfg.input_type == "script" else "from prompt",
+                 cfg.topic, {"script": "own script", "source": "source/" + cfg.source_mode}.get(cfg.input_type, "from prompt"),
                  cfg.language, cfg.screen_language, cfg.voice)
         check_urdu_font(cfg)
+        cfg.research_notes = ""
+        if cfg.web_research:   # required, never skipped: a failed search fails the video
+            cfg.research_notes = stage_research(gem, cfg, work)["notes"]
         log.info("[1/6] Script")
-        write = stage_script_text if cfg.input_type == "script" else stage_script   # own script: split it, never rewrite it
+        write = {"script": stage_script_text, "source": stage_script_source}.get(cfg.input_type, stage_script)   # own script: split it, never rewrite it
         script = cached(work / "1_script.json", lambda: write(gem, cfg, work))
         log.info("[2/6] Narration audio + sentence timeline")
         audio = stage_audio(tts, cfg, script, work)
         log.info("[3/6] Concepts, examples, key points, visuals")
         analysis = cached(work / "3_analysis.json", lambda: stage_analyze(gem, cfg, script))
-        log.info("[4/6] Manim visual spec (steps pinned to spoken sentences)")
+        log.info("[4/6] Visual spec (steps pinned to spoken sentences) + engine choice per scene")
         spec = cached(work / "4_manim_spec.json", lambda: stage_spec(gem, cfg, script, audio, analysis))
-        log.info("[5/6] Manim code + render")
-        clips = stage_manim(gem, cfg, spec, work)
+        env = Env(cfg)                                   # checks Node / Manim, installs Remotion on the first run
+        route = stage_route(gem, cfg, spec, env, work)   # Remotion is preferred; Manim only for real math plots
+        log.info("[5/6] Code + render (Remotion / Manim per scene, with fallback)")
+        clips = stage_visuals(gem, cfg, spec, route, env, work)
         log.info("[6/6] Sync + assemble")
         final = Path(cfg.output_dir) / f"{cfg.slug}.mp4"
         stage_assemble(cfg, script, spec, audio, clips, work, final)
-        log.info("DONE: %s (+ .srt, .manifest.json)", final)
+        if script.get("scene_plan"):       # what happened to the user's storyboard: kept / added / dropped / own file used or not
+            from scene_plan import build_report
+            save_json(final.with_suffix(".scenes.json"), build_report(cfg, script, work, script["scene_plan"]))
+        log.info("DONE: %s (+ .srt, .manifest.json%s)", final, ", .scenes.json" if script.get("scene_plan") else "")
         return final
     finally:
         log.removeHandler(fh)
@@ -159,6 +168,8 @@ def main():
             ap.add_argument(flag, default=None,
                             type=float if f.type in ("float", float) else
                             int if f.type in ("int", int) else str)
+    ap.add_argument("--scenes-file", help="your storyboard: a text file (Scene 1: ... / Scene 2: ...) or a JSON list of scenes "
+                                          '[{"title","description"}, {"source":"file","path":"my_scene.py"}]')
     ap.add_argument("--script-file", help="text file with a finished script; the topic argument is then the video title")
     ap.add_argument("--list-models", action="store_true",
                     help="print the Flash / TTS models your first Gemini key can see, then exit")
@@ -173,6 +184,8 @@ def main():
     names = {f.name for f in fields(VideoConfig)}
     base = {k: v for k, v in vars(args).items() if k in names and v is not None and k != "topic"}
 
+    if args.scenes_file:
+        base["custom_scenes"] = Path(args.scenes_file).read_text(encoding="utf-8")
     if args.script_file:
         base["script"] = Path(args.script_file).read_text(encoding="utf-8")
     if args.list_models:
@@ -196,9 +209,11 @@ def main():
     if not jobs:
         sys.exit("Give a topic, --topics-file or --config")
 
-    for tool in ("manim", "ffmpeg", "ffprobe"):
+    for tool in ("ffmpeg", "ffprobe"):
         if not args.tts_test and not shutil.which(tool):
             sys.exit(f"'{tool}' not found on PATH (see README)")
+    if not args.tts_test and not (shutil.which("manim") or (shutil.which("node") and shutil.which("npx"))):
+        sys.exit("Neither Remotion (Node.js 18+) nor Manim was found on PATH (see README)")
     if not shutil.which("ffmpeg"):
         sys.exit("'ffmpeg' not found on PATH")
 

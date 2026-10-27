@@ -39,6 +39,7 @@ from googleapiclient.http import MediaFileUpload           # noqa: E402
 from config import DEFAULT_TTS_MODELS, VideoConfig, csv, detect_language, normalize_aspect    # noqa: E402
 from gemini_client import Gemini, QuotaExhausted           # noqa: E402
 from pipeline import Services, make_video                  # noqa: E402
+from scene_input import load_scenes                        # noqa: E402
 from tts import TTS                                        # noqa: E402
 
 log = logging.getLogger("edu")
@@ -81,7 +82,11 @@ FIELD_TYPES = {f.name: str(f.type) for f in fields(VideoConfig)}
 LANG = {"english": "en", "en": "en", "urdu": "ur", "ur": "ur", "اردو": "ur"}
 ROW_MAP = {"topic / prompt": "topic", "minutes": "minutes", "audience": "audience",
            "language": "language", "screen language": "screen_language", "voice": "voice",
-           "input type": "input_type", "script": "script", "aspect": "aspect"}
+           "input type": "input_type", "script": "script", "aspect": "aspect",
+           "source mode": "source_mode", "custom instruction": "custom_instruction",
+           "engine": "engine", "engine fixed": "engine_fixed", "web research": "web_research",
+           "video folder id": "video_folder_id", "input folder id": "input_folder_id",
+           "output folder id": "output_folder_id", "video folder link": "video_folder_link"}
 SINGLES = "Singles"
 
 
@@ -256,6 +261,14 @@ def global_cfg(g):
 
 def coerce(name, v):
     t = FIELD_TYPES[name]
+    if t == "list":
+        if isinstance(v, list):
+            return v
+        try:
+            a = json.loads(str(v or "").strip() or "[]")
+            return a if isinstance(a, list) else None
+        except ValueError:
+            return None
     if v is None or (isinstance(v, str) and not v.strip()):
         return None
     try:
@@ -281,6 +294,15 @@ def only_fields(d):
     return out
 
 
+def clip_for_backend(i, c):
+    """Frontend clip (camelCase, saved in the sheet) -> the snake_case shape the backend uses (same as frontend clipsFor)."""
+    return {"order": i, "name": c.get("name", ""), "type": c.get("kind", "image"), "file_id": c.get("fileId", ""),
+            "url": c.get("url", ""), "start_sec": c.get("start", 0), "duration_sec": c.get("duration", 5),
+            "position": c.get("position", "bottom-right"), "width_pct": c.get("width", 25),
+            "opacity_pct": c.get("opacity", 100), "loop": bool(c.get("loop")), "mute": c.get("mute", True),
+            "note": c.get("note", "")}
+
+
 def build_job(gcfg, pcfg, row):
     d = {**gcfg, **flat(pcfg)}
     for col, f in ROW_MAP.items():
@@ -298,10 +320,30 @@ def build_job(gcfg, pcfg, row):
             d.update(flat(json.loads(extra)))
         except ValueError:
             log.warning("  bad Extra Config JSON, ignored")
+    clips = str(row.get("custom clips (json)", "")).strip()    # video level only: never inherited from project / global
+    d.pop("custom_clips", None)
+    if clips:
+        try:
+            raw = json.loads(clips)
+            d["custom_clips"] = [clip_for_backend(i, c) for i, c in enumerate(raw if isinstance(raw, list) else [], 1)
+                                 if isinstance(c, dict) and (c.get("fileId") or c.get("url"))]
+        except ValueError:
+            log.warning("  bad Custom Clips JSON, ignored")
+    scenes = str(row.get("scenes (json)", "")).strip()          # video level only: the user's storyboard (descriptions / own files)
+    d.pop("custom_scenes", None)
+    if scenes:
+        d["custom_scenes"] = load_scenes(scenes)               # frontend JSON, or plain text typed into the cell
     if not str(d.get("topic", "")).strip():
         d["topic"] = row.get("video title", "")        # a script row has no prompt: its title is the topic
     script, mode = str(d.get("script", "")).strip(), str(d.get("input_type", "")).strip().lower()
-    if script and mode != "prompt" and not str(row.get("language", "")).strip():
+    if mode == "source" or (not mode and script and str(d.get("source_mode", "")).strip()):
+        d["input_type"], d["source_text"] = "source", script      # the source text lives in the Script column
+        d["script"] = ""
+    if str(d.get("engine", "")).strip().lower() == "both":
+        d["engine"] = "auto"
+    fixed = str(d.get("engine_fixed", "")).strip().lower() in ("1", "true", "yes", "y", "fixed")
+    d["engine_fallback"] = not fixed and str(d.get("engine", "auto")).strip().lower() != "auto"
+    if script and mode not in ("prompt",) and not str(row.get("language", "")).strip():
         # the row did not pick a language: follow the script itself (an Urdu script must not be narrated as English)
         have = LANG.get(str(d.get("language", "en")).strip().lower(), "en")
         seen = detect_language(script)
@@ -323,6 +365,40 @@ def build_job(gcfg, pcfg, row):
 # --------------------------------------------------------------------------- #
 def safe_name(title):
     return re.sub(r'[\\/:*?"<>|]+', " ", title).strip()[:120] or "video"
+
+
+MAX_SCENE_FILE = 60 * 1024 * 1024
+
+
+def drive_id(url):
+    m = re.search(r"/(?:d|folders)/([\w-]{10,})", url or "") or re.search(r"[?&]id=([\w-]{10,})", url or "")
+    return m.group(1) if m else ""
+
+
+def fetch_scene_files(dr, cfg):
+    """Download the user's own scene files (Manim .py / Remotion .tsx .zip ...) into build/<slug>/scene_files and set local_path.
+    A file that cannot be fetched is left without local_path: that scene is then built by Frame from its description."""
+    todo = [c for c in cfg.custom_scenes if c.get("source") == "file"]
+    if not todo:
+        return
+    dest = Path("build") / cfg.slug / "scene_files"
+    dest.mkdir(parents=True, exist_ok=True)
+    for c in todo:
+        name = re.sub(r"[^\w.\-]+", "_", c.get("file_name") or "scene")[:80]
+        try:
+            fid = c.get("file_id") or drive_id(c.get("url"))
+            if not fid:
+                raise ValueError("no Drive file id")
+            data = ex(dr.d.files().get_media(fileId=fid))
+            if len(data) > MAX_SCENE_FILE:
+                raise ValueError("file is larger than 60 MB")
+            p = dest / f"scene-{int(c['order']):02d}-{name}"
+            p.write_bytes(data)
+            c["local_path"] = str(p)
+            log.info("  scene %s: downloaded your file %s (%d KB)", c["order"], c.get("file_name"), len(data) // 1024)
+        except Exception as e:  # noqa: BLE001
+            c["local_path"] = ""
+            log.warning("  scene %s: could not download %s (%s); Frame builds it from the description", c["order"], c.get("file_name"), str(e)[:120])
 
 
 def process_project(dr, svc, gcfg, name, prow, per_turn):
@@ -366,9 +442,10 @@ def process_project(dr, svc, gcfg, name, prow, per_turn):
         dr.log_row(sheet_id, "Build started", title)
         try:
             cfg = VideoConfig(**build_job(gcfg, pcfg, row))
-            log.info("[%s] #%d %s (%s)", name, rn - 1, title, "own script" if cfg.input_type == "script" else "prompt")
+            log.info("[%s] #%d %s (%s)", name, rn - 1, title, {"script": "own script", "source": "source text (" + cfg.source_mode + ")"}.get(cfg.input_type, "prompt"))
+            fetch_scene_files(dr, cfg)
             final = make_video(cfg, svc)
-            out = dr.folder("Output", pfolder)
+            out = cfg.output_folder_id or dr.folder("Output", pfolder)   # the frontend gives every video its own Output folder
             link = dr.upload(final, safe_name(title) + ".mp4", out)
             srt, caps = Path(final).with_suffix(".srt"), ""     # captions go next to the video, same name: "<title>.srt"
             if srt.exists():
@@ -378,11 +455,19 @@ def process_project(dr, svc, gcfg, name, prow, per_turn):
                     log.warning("[%s] #%d captions (.srt) were not uploaded: %s", name, rn - 1, str(e)[:150])
             if caps:
                 table.ensure("Captions Link")
-            table.update(rn, {"Status": "Completed", "Output Link": link, "Captions Link": caps, "Notes": "", "Updated": now()})
+            note, rep_file = "", Path(final).with_suffix(".scenes.json")
+            if rep_file.exists():                               # what became of the user's storyboard
+                try:
+                    from scene_plan import summary_line
+                    note = summary_line(json.loads(rep_file.read_text(encoding="utf-8")))
+                    dr.upload(rep_file, safe_name(title) + ".scenes.json", out)
+                except Exception as e:  # noqa: BLE001   the video is already saved: a report hiccup must not fail it
+                    log.warning("[%s] #%d scene report was not saved: %s", name, rn - 1, str(e)[:150])
+            table.update(rn, {"Status": "Completed", "Output Link": link, "Captions Link": caps, "Notes": note, "Updated": now()})
             dr.log_row(sheet_id, "Video saved", title)
             shutil.rmtree(Path("build") / cfg.slug, ignore_errors=True)
             Path(final).unlink(missing_ok=True)
-            for ext in (".srt", ".manifest.json"):
+            for ext in (".srt", ".manifest.json", ".scenes.json"):
                 Path(final).with_suffix(ext).unlink(missing_ok=True)
         except QuotaExhausted as e:
             table.update(rn, {"Status": "Waiting", "Notes": f"{GH_TAG} quota, retry next run", "Updated": now()})
